@@ -20,8 +20,8 @@ try: from DexLab.pump_fun import PumpFun
 except: from .DexLab.pump_fun import PumpFun
 try: from DexLab.swaps import SolanaSwaps
 except: from .DexLab.swaps import SolanaSwaps
-try: from DexLab.utils import lamports_to_tokens, usd_to_lamports, usd_to_microlamports
-except: from .DexLab.utils import lamports_to_tokens, usd_to_lamports, usd_to_microlamports
+try: from DexLab.utils import usd_to_lamports, usd_to_microlamports
+except: from .DexLab.utils import usd_to_lamports, usd_to_microlamports
 from aiohttp import ClientSession
 from settings import *
 from solana.rpc.async_api import AsyncClient
@@ -85,6 +85,7 @@ class Dexter:
         self.holdings = {}
         self.privkey = Keypair.from_bytes(base58.b58decode(PRIV_KEY))
         self.wallet_balance = 0
+        self.pending_buy_spend = {}
         self.wallet = str(self.privkey.pubkey())
         self.dex_dir = DEX_DIR
         self.logs = asyncio.Queue()
@@ -398,6 +399,34 @@ class Dexter:
         elif result in ["safe", "stagnant", "drop-time"]:
             logging.info(f"{cc.GREEN}Safe {owner} for {result}.{cc.RESET}")
 
+    def _reserved_wallet_balance(self) -> int:
+        return int(sum(self.pending_buy_spend.values()))
+
+    def _available_wallet_balance(self) -> int:
+        return max(0, int(self.wallet_balance - self._reserved_wallet_balance()))
+
+    def _reserve_buy_spend(self, mint_id: str, lamports: int):
+        self.pending_buy_spend[mint_id] = int(max(0, lamports))
+
+    def _release_buy_spend(self, mint_id: str) -> int:
+        return int(self.pending_buy_spend.pop(mint_id, 0))
+
+    def _finalize_buy_spend(self, mint_id: str, confirmed_wallet_balance: int | None = None):
+        reserved_cost = self._release_buy_spend(mint_id)
+        if reserved_cost <= 0 and confirmed_wallet_balance is None:
+            return
+
+        old_balance = self.wallet_balance
+        if confirmed_wallet_balance is not None:
+            self.wallet_balance = int(confirmed_wallet_balance)
+        elif reserved_cost > 0:
+            self.wallet_balance = max(0, int(self.wallet_balance - reserved_cost))
+
+        logging.info(
+            f"Wallet difference: {old_balance} -> {self.wallet_balance} = "
+            f"{self.wallet_balance - old_balance}"
+        )
+
     async def get_latest_price(self, mint_id: str) -> Decimal:
         """
         Fetch the latest price for a given mint ID from swap folder.
@@ -426,31 +455,55 @@ class Dexter:
             # Here change buy price
             amount = AMOUNT_BUY_TL_1 if trust_level == 1 else AMOUNT_BUY_TL_2
             lamports = await usd_to_lamports(amount, self.analyzer.sol_price_usd)
-            if self.wallet_balance <= lamports:
+            fee = usd_to_microlamports(BUY_FEE, self.analyzer.sol_price_usd, 50_000) if trust_level == 1 else usd_to_microlamports(BUY_FEE, self.analyzer.sol_price_usd, 50_000)
+            reserved_cost = lamports + int(fee / 1e4)
+            available_balance = self._available_wallet_balance()
+            if available_balance <= reserved_cost:
                 self.holdings.pop(mint_id, None)
-                logging.info(f"{cc.RED}Insufficient balance for {mint_id}, wallet: {self.wallet_balance}, lamports: {lamports}.{cc.RESET}")
+                logging.info(
+                    f"{cc.RED}Insufficient balance for {mint_id}, confirmed_wallet: "
+                    f"{self.wallet_balance}, reserved: {self._reserved_wallet_balance()}, "
+                    f"available: {available_balance}, required: {reserved_cost}.{cc.RESET}"
+                )
                 return
             
             price = await self.get_latest_price(mint_id)
-            token_amount = await lamports_to_tokens(lamports, price)
+            if price <= 0:
+                logging.info(
+                    f"{cc.YELLOW}Local price snapshot is unavailable for {mint_id}; "
+                    f"continuing with the on-chain bonding-curve quote.{cc.RESET}"
+                )
+                price = Decimal('0')
+
             # 0.1USD fee, 50k compute units
-            fee = usd_to_microlamports(BUY_FEE, self.analyzer.sol_price_usd, 50_000) if trust_level == 1 else usd_to_microlamports(BUY_FEE, self.analyzer.sol_price_usd, 50_000)
-            slippage = SLIPPAGE_AMOUNT # type: ignore
+            slippage = float(SLIPPAGE_AMOUNT) # type: ignore
 
             tx_id = await self.pump_swap.pump_buy(
                 mint_id, 
                 bonding_curve,
                 lamports,
                 owner,
-                token_amount,
-                False, 
-                fee,
-                slippage
+                sim=False,
+                priority_micro_lamports=fee,
+                slippage=slippage
             )
             if tx_id == "migrated":
                 logging.info(f"{cc.RED}Bonding curve migrated for {mint_id}. Ending session.{cc.RESET}")
                 self.holdings.pop(mint_id, None)
                 return "migrated"
+
+            if tx_id == "zero_quote":
+                logging.info(f"{cc.RED}Skipping buy for {mint_id}: quote resolved to zero output.{cc.RESET}")
+                self.holdings.pop(mint_id, None)
+                return "zero_quote"
+
+            if tx_id == "creator_vault_unavailable":
+                logging.info(
+                    f"{cc.YELLOW}Skipping buy for {mint_id}: bonding-curve creator data "
+                    f"is not readable on RPC yet. Retrying session.{cc.RESET}"
+                )
+                self.holdings.pop(mint_id, None)
+                return "creator_vault_unavailable"
             
             if self.time_start != 0:
                 logging.info(f"Full time taken to buy: {time.time() - self.time_start}s")
@@ -459,9 +512,13 @@ class Dexter:
                 logging.info(f"{cc.RED}Price too high for {mint_id}. Ending session.{cc.RESET}")
                 self.holdings.pop(mint_id, None)
                 return "PriceTooHigh"
-            
-            self.wallet_balance -= (lamports + (fee / 1e4))
-            logging.info(f"{cc.WHITE}Buy at {price:.10f} for {mint_id} (trust_level: {trust_level}).{cc.RESET}")
+
+            self._reserve_buy_spend(mint_id, reserved_cost)
+            logging.info(
+                f"{cc.WHITE}Submitted buy for {mint_id} "
+                f"(local_price: {price:.10f}, trust_level: {trust_level}, "
+                f"slippage: {slippage}, tx: {tx_id}).{cc.RESET}"
+            )
             await self.save_result({"type": "buy", "mint_id": mint_id, "owner": owner, "price": str(price), "trust_level": trust_level})
             return tx_id
         
@@ -495,6 +552,19 @@ class Dexter:
                     logging.info(f"{cc.RED}Bonding curve migrated for {mint_id} to PumpSwapAMM. Ending session.{cc.RESET}")
                     self.holdings.pop(mint_id, None)
                     return "migrated"
+
+                if tx_id_sell == "missing_ata":
+                    logging.info(f"{cc.RED}Skipping sell for {mint_id}: associated token account is missing.{cc.RESET}")
+                    self.holdings.pop(mint_id, None)
+                    return "missing_ata"
+
+                if tx_id_sell == "creator_vault_unavailable":
+                    logging.info(
+                        f"{cc.YELLOW}Skipping sell for {mint_id}: bonding-curve creator data "
+                        f"is not readable on RPC yet.{cc.RESET}"
+                    )
+                    self.holdings.pop(mint_id, None)
+                    return "creator_vault_unavailable"
 
                 results = await self.swaps.get_swap_tx(tx_id_sell, mint_id, max_retries=6, tx_type="sell")
 
@@ -606,10 +676,17 @@ class Dexter:
                         if result == "PriceTooHigh":
                             logging.info(f"{cc.RED}Ending session for {mint_id} due to high buy price.{cc.RESET}")
                             break
+                        if result == "zero_quote":
+                            await asyncio.sleep(0.25)
+                            continue
+                        if result == "creator_vault_unavailable":
+                            await asyncio.sleep(0.25)
+                            continue
                         buy_tx_id = result
                         continue  # Jump straight to next iteration so we fetch our tx
 
                     if not skip_if_done:
+                        confirmed_wallet_balance = None
                         we = holders.get(self.wallet, {})
                         balance = we.get("balance", 0)
                         balance_changes = we.get("balance_changes", [])
@@ -626,12 +703,15 @@ class Dexter:
                             logging.info(f"{cc.RED}Buy retry exceeded for {mint_id}.\nTrying a fallback...{cc.RESET}")
                             results = await self.swaps.get_swap_tx(buy_tx_id, mint_id, tx_type="buy")
                             if not results or isinstance(results, str):
+                                self._release_buy_spend(mint_id)
                                 self.holdings.pop(mint_id, None)
                                 logging.info(f"{cc.BLINK}Buy was not successful :( {mint_id}{cc.RESET}")
                                 break
                             token_balance = int(results.get("balance", 0))
                             selfBuyPrice = Decimal(results.get("price", 0))
+                            confirmed_wallet_balance = results.get("sol_balance")
                             if token_balance <= 0 or selfBuyPrice <= 0:
+                                self._release_buy_spend(mint_id)
                                 self.holdings.pop(mint_id, None)
                                 break
                         if token_balance <= 0 or selfBuyPrice <= 0:
@@ -639,6 +719,9 @@ class Dexter:
                             logging.info(f"{cc.YELLOW}No balance or couldn't get buy price for {mint_id}, retry {buy_retry}.{cc.RESET}")
                             await asyncio.sleep(0.5)
                             continue
+
+                        if mint_id in self.pending_buy_spend:
+                            self._finalize_buy_spend(mint_id, confirmed_wallet_balance)
 
                     # personal peak change from buy price
                     selfPeakChange = await self._process_peak_change(selfBuyPrice, peak_price)
@@ -795,6 +878,7 @@ class Dexter:
         self.active_sessions.pop(mint_id, None)
         self.swap_folder.pop(mint_id, None)
         self.holdings.pop(mint_id, None)
+        self._release_buy_spend(mint_id)
         logging.info(f"{cc.BLUE}Session ended {mint_id}.{cc.RESET}")
 
     async def update_leaderboard(self):
@@ -910,4 +994,3 @@ def run():
 if __name__ == '__main__':
     dexter = Dexter(DB_DSN)
     asyncio.run(dexter.run())
-

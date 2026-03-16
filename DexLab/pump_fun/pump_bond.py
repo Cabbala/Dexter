@@ -21,6 +21,9 @@ class BondingCurveState:
     def __init__(self, data: bytes) -> None:
         parsed = self._STRUCT.parse(data[8:])
         self.__dict__.update(parsed)
+        trailing = data[8 + self._STRUCT.sizeof():]
+        self.is_mayhem_mode = bool(trailing[0]) if len(trailing) >= 1 else False
+        self.is_cashback_coin = bool(trailing[1]) if len(trailing) >= 2 else False
 
 def get_associated_bonding_curve_address(mint: Pubkey, program_id: Pubkey = Pubkey.from_string("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")) -> tuple[Pubkey, int]:
     # by derive

@@ -144,7 +144,8 @@ class SolanaSwaps:
                                         logging.info(f"Transaction verified for {tx_id}")
                                         token_balance = post_token_balance.get("uiTokenAmount", {}).get("amount")
                                         price = self.process_log(data)
-                                        return {"balance": token_balance, "price": price}
+                                        sol_balance = post_balances[0] if post_balances else None
+                                        return {"balance": token_balance, "price": price, "sol_balance": sol_balance}
                         elif tx_type == "sell":
                             if post_balances:
                                 sol_balance = post_balances[0]

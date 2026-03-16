@@ -39,8 +39,8 @@ SNIPING_PRICE_TIME = 0.0
 
 # Refer to set_trust_level method in Dexter.py to understand how trust levels are determined
 # Dexter automatically handles USD to SOL conversion, no need to worry about it
-AMOUNT_BUY_TL_2 = 0.1 # 10 USD for creators with Trust Level 2
-AMOUNT_BUY_TL_1 = 0.05 # 10 USD for creators with Trust Level 1
+AMOUNT_BUY_TL_2 = 0.01 # X USD for creators with Trust Level 2
+AMOUNT_BUY_TL_1 = 0.01 # Y USD for creators with Trust Level 1
 BUY_FEE = 0.006 # 0.1 USD
 SELL_FEE = 0.006 # 0.1 USD
 SLIPPAGE_AMOUNT = 1.30 # 90%, 30% is safer
