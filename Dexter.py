@@ -8,6 +8,8 @@ try: from DexAI.trust_factor import Analyzer
 except: from .DexAI.trust_factor import Analyzer
 try: from DexLab.common_ import *
 except: from .DexLab.common_ import *
+try: from DexLab.instrumentation import DexterInstrumentation
+except: from .DexLab.instrumentation import DexterInstrumentation
 import asyncpg, collections
 import datetime, time
 from decimal import Decimal
@@ -79,6 +81,7 @@ class Dexter:
         self.db_dsn = db_dsn
         self.pool = None
         self.analyzer = Analyzer(db_dsn)
+        self.instrumentation = DexterInstrumentation(DEX_DIR)
         self.last_processed_timestamp = None
         self.leaderboard = None
         self.active_sessions = {}
@@ -102,6 +105,43 @@ class Dexter:
         )
         self.sub_second_counters = {}
         self.mint_locks = collections.defaultdict(asyncio.Lock)  # One lock per mint_id
+        self.instrumentation.export_masked_config(self._settings_snapshot())
+
+    def _settings_snapshot(self):
+        return {
+            "db_dsn": DB_DSN,
+            "wallet": self.wallet,
+            "buy_amount_tl_1": AMOUNT_BUY_TL_1,
+            "buy_amount_tl_2": AMOUNT_BUY_TL_2,
+            "buy_fee_usd": BUY_FEE,
+            "sell_fee_usd": SELL_FEE,
+            "slippage_amount": SLIPPAGE_AMOUNT,
+            "price_step_units": PRICE_STEP_UNITS,
+            "profit_margin": str(PROFIT_MARGIN),
+            "increment_threshold": str(INCREMENT_THRESHOLD),
+            "decrement_threshold": str(DECREMENT_THRESHOLD),
+            "drop_time": DROP_TIME,
+            "stagnant_under_price": STAGNANT_UNDER_PRICE,
+            "leaderboard_update_interval": LEADERBOARD_UPDATE_INTERVAL,
+            "windows_runtime_root": os.getenv("VEXTER_RUNTIME_ROOT", r"C:\Users\bot\quant\Vexter"),
+        }
+
+    def _slippage_bps(self):
+        return int(float(SLIPPAGE_AMOUNT) * 10000)
+
+    def _expected_tokens_out(self, lamports, price):
+        quote_price = Decimal(str(price)) if price else Decimal('0')
+        if quote_price <= 0:
+            return Decimal('0')
+        return (Decimal(lamports) / Decimal('1e9')) / quote_price
+
+    def _compute_liquidity(self, vsr, vtr, price):
+        try:
+            sol_reserves = Decimal(vsr) / Decimal('1e9')
+            token_reserves = Decimal(vtr) / Decimal('1e6')
+            return float((sol_reserves + (token_reserves * Decimal(price))) * self.analyzer.sol_price_usd)
+        except Exception:
+            return 0.0
     
     """
         Market part
@@ -123,18 +163,19 @@ class Dexter:
             if clean_log:
                 is_mint = clean_log["is_mint"]
                 sig = clean_log["sig"]
+                slot = clean_log["slot"]
                 program_data = clean_log["program_data"]
 
                 for idx, data in program_data.items():
                     if is_mint and "bonding_curve" in data:
-                        await self.process_data("mints", sig, data)
+                        await self.process_data("mints", sig, data, slot=slot)
                     elif "bonding_curve" in data or "sol_amount" in data:
-                        await self.process_data("swaps", sig, data)
+                        await self.process_data("swaps", sig, data, slot=slot)
         except Exception as e:
             logging.error(f"{cc.RED}Error in handle_single_log: {e}{cc.RESET}")
             traceback.print_exc()
 
-    async def process_data(self, type, sig, data):
+    async def process_data(self, type, sig, data, slot=None):
         """
             This method does concurrency control & the sub-second timestamp logic for each swap.
         """
@@ -163,6 +204,15 @@ class Dexter:
                     logging.info(
                         f"Processed Mint: {mint}, owner: {owner}, created: {time.strftime('%H:%M:%S')}, "
                         f"{cc.GREEN}Match{cc.RESET}"
+                    )
+                    self.instrumentation.observe_mint(
+                        mint,
+                        owner,
+                        bonding_curve=bonding_curve,
+                        open_price=0,
+                        slot=slot,
+                        mint_sig=sig,
+                        name=name,
                     )
 
                 # If it's an owner in the leaderboard, set up a session
@@ -209,6 +259,7 @@ class Dexter:
                 price = await self._compute_price(vsr, vtr)
                 mc = await self._get_market_cap(price)
                 price_usd = float(price * self.analyzer.sol_price_usd)
+                liquidity = self._compute_liquidity(vsr, vtr, price)
 
                 if "state" not in self.swap_folder[mint]:
                     self.swap_folder[mint]["state"] = {
@@ -216,6 +267,7 @@ class Dexter:
                         "open_price": price,
                         "high_price": price,
                         "mc": mc,
+                        "liquidity": liquidity,
                         "price_usd": price_usd,
                         "last_tx_time": unique_timestamp,
                         "holders": {
@@ -237,6 +289,7 @@ class Dexter:
                     if price > st["high_price"]:
                         st["high_price"] = price
                     st["mc"] = mc
+                    st["liquidity"] = liquidity
                     st["price_usd"] = price_usd
                     st["last_tx_time"] = unique_timestamp
                     st["tx_counts"]["swaps"] += 1
@@ -450,6 +503,12 @@ class Dexter:
             if not bonding_curve:
                 logging.info(f"{cc.RED}Bonding curve not found for {mint_id}.{cc.RESET}")
                 self.holdings.pop(mint_id, None)
+                self.instrumentation.record_entry_rejected(
+                    mint_id,
+                    owner,
+                    reject_reason="bonding_curve_missing",
+                    details={"trust_level": trust_level},
+                )
                 return
             
             # Here change buy price
@@ -465,6 +524,15 @@ class Dexter:
                     f"{self.wallet_balance}, reserved: {self._reserved_wallet_balance()}, "
                     f"available: {available_balance}, required: {reserved_cost}.{cc.RESET}"
                 )
+                self.instrumentation.record_entry_rejected(
+                    mint_id,
+                    owner,
+                    reject_reason="insufficient_balance",
+                    details={
+                        "required_lamports": reserved_cost,
+                        "wallet_available_before": available_balance,
+                    },
+                )
                 return
             
             price = await self.get_latest_price(mint_id)
@@ -477,6 +545,17 @@ class Dexter:
 
             # 0.1USD fee, 50k compute units
             slippage = float(SLIPPAGE_AMOUNT) # type: ignore
+            attempt_index = self.instrumentation.record_entry_attempt(
+                mint_id,
+                owner,
+                quote_price=price,
+                expected_tokens_out=self._expected_tokens_out(lamports, price),
+                slippage_bps=self._slippage_bps(),
+                wallet_available_before=available_balance,
+                reserved_balance_before=self._reserved_wallet_balance(),
+                reserved_cost=reserved_cost,
+                tx_strategy="pump_buy_priority_fee",
+            )
 
             tx_id = await self.pump_swap.pump_buy(
                 mint_id, 
@@ -490,11 +569,23 @@ class Dexter:
             if tx_id == "migrated":
                 logging.info(f"{cc.RED}Bonding curve migrated for {mint_id}. Ending session.{cc.RESET}")
                 self.holdings.pop(mint_id, None)
+                self.instrumentation.record_entry_rejected(
+                    mint_id,
+                    owner,
+                    reject_reason="migrated",
+                    attempt_index=attempt_index,
+                )
                 return "migrated"
 
             if tx_id == "zero_quote":
                 logging.info(f"{cc.RED}Skipping buy for {mint_id}: quote resolved to zero output.{cc.RESET}")
                 self.holdings.pop(mint_id, None)
+                self.instrumentation.record_entry_rejected(
+                    mint_id,
+                    owner,
+                    reject_reason="zero_quote",
+                    attempt_index=attempt_index,
+                )
                 return "zero_quote"
 
             if tx_id == "creator_vault_unavailable":
@@ -503,6 +594,12 @@ class Dexter:
                     f"is not readable on RPC yet. Retrying session.{cc.RESET}"
                 )
                 self.holdings.pop(mint_id, None)
+                self.instrumentation.record_entry_rejected(
+                    mint_id,
+                    owner,
+                    reject_reason="creator_vault_unavailable",
+                    attempt_index=attempt_index,
+                )
                 return "creator_vault_unavailable"
             
             if self.time_start != 0:
@@ -511,6 +608,12 @@ class Dexter:
             if tx_id == "PriceTooHigh":
                 logging.info(f"{cc.RED}Price too high for {mint_id}. Ending session.{cc.RESET}")
                 self.holdings.pop(mint_id, None)
+                self.instrumentation.record_entry_rejected(
+                    mint_id,
+                    owner,
+                    reject_reason="price_too_high",
+                    attempt_index=attempt_index,
+                )
                 return "PriceTooHigh"
 
             self._reserve_buy_spend(mint_id, reserved_cost)
@@ -591,6 +694,21 @@ class Dexter:
                     logging.info(f"{cc.BLINK}{cc.RED}Sell failed for {mint_id}, increase your priority fee or check if you have sufficient balance.{cc.RESET}")
                     return
 
+                self.instrumentation.record_exit_fill(
+                    mint_id,
+                    owner,
+                    fill_price=price,
+                    fill_qty=amount,
+                    tx_signature=tx_id_sell,
+                    exit_reason=reason,
+                    wallet_balance_after=self.wallet_balance,
+                )
+                self.instrumentation.record_position_closed(
+                    mint_id,
+                    owner,
+                    stale_position_flag=reason in {"stagnant", "drop-time"},
+                )
+
         except Exception as e:
             logging.error(f"Sell transaction failed: {e}")
             traceback.print_exc()
@@ -615,6 +733,14 @@ class Dexter:
         logging.info(f"{cc.BLUE}Session started for {mint_id} (owner: {owner}). Monitoring...{cc.RESET}")
 
         if owner in BLACKLIST or (SINGLE_LOCK and len(self.holdings) > 0) or self.updating:
+            reject_reason = "blacklist" if owner in BLACKLIST else "single_lock" if (SINGLE_LOCK and len(self.holdings) > 0) else "leaderboard_update"
+            gate_name = "blacklist" if owner in BLACKLIST else "single_lock" if (SINGLE_LOCK and len(self.holdings) > 0) else "update_lock"
+            self.instrumentation.record_candidate_rejected(
+                mint_id,
+                owner,
+                reject_reason=reject_reason,
+                gate_name=gate_name,
+            )
             logging.info(f"{cc.YELLOW}Owner {owner} is blacklisted, a single lock is enabled, or leaderboard is updating rn. Skipping session.{cc.RESET}")
             self.swap_folder.pop(mint_id, None)
             return
@@ -650,6 +776,8 @@ class Dexter:
         skip_if_done = False
         buy_tx_id = ""
         increment_threshold = Decimal('25')
+        entry_signal_emitted = False
+        entry_fill_emitted = False
 
         while True:
             try:
@@ -669,6 +797,17 @@ class Dexter:
                     sells = tx_counts.get("sells", 0)
                     open_price = row.get('open_price', Decimal('0'))
                     peak_price = row.get('high_price', Decimal('0'))
+                    liquidity = row.get('liquidity', 0)
+
+                    if not entry_signal_emitted:
+                        self.instrumentation.record_entry_signal(
+                            mint_id,
+                            owner,
+                            signal_price=price,
+                            trust_level=trust_level,
+                            bonding_curve=self.swap_folder[mint_id]["bonding_curve"],
+                        )
+                        entry_signal_emitted = True
 
                     # Buy if not already
                     if mint_id not in self.holdings:
@@ -703,6 +842,11 @@ class Dexter:
                             logging.info(f"{cc.RED}Buy retry exceeded for {mint_id}.\nTrying a fallback...{cc.RESET}")
                             results = await self.swaps.get_swap_tx(buy_tx_id, mint_id, tx_type="buy")
                             if not results or isinstance(results, str):
+                                self.instrumentation.record_entry_rejected(
+                                    mint_id,
+                                    owner,
+                                    reject_reason="buy_confirmation_failed",
+                                )
                                 self._release_buy_spend(mint_id)
                                 self.holdings.pop(mint_id, None)
                                 logging.info(f"{cc.BLINK}Buy was not successful :( {mint_id}{cc.RESET}")
@@ -711,6 +855,11 @@ class Dexter:
                             selfBuyPrice = Decimal(results.get("price", 0))
                             confirmed_wallet_balance = results.get("sol_balance")
                             if token_balance <= 0 or selfBuyPrice <= 0:
+                                self.instrumentation.record_entry_rejected(
+                                    mint_id,
+                                    owner,
+                                    reject_reason="buy_confirmation_invalid",
+                                )
                                 self._release_buy_spend(mint_id)
                                 self.holdings.pop(mint_id, None)
                                 break
@@ -722,6 +871,18 @@ class Dexter:
 
                         if mint_id in self.pending_buy_spend:
                             self._finalize_buy_spend(mint_id, confirmed_wallet_balance)
+
+                        if not entry_fill_emitted:
+                            self.instrumentation.record_entry_fill(
+                                mint_id,
+                                owner,
+                                fill_price=selfBuyPrice,
+                                fill_qty=token_balance,
+                                tx_signature=buy_tx_id,
+                                wallet_balance_after=self.wallet_balance,
+                                confirmation_path="rpc_fallback" if buy_retry >= 10 else "holder_balance",
+                            )
+                            entry_fill_emitted = True
 
                     # personal peak change from buy price
                     selfPeakChange = await self._process_peak_change(selfBuyPrice, peak_price)
@@ -824,6 +985,13 @@ class Dexter:
 
                     # Sell if selfPeakChange >= to_sell or malicious or drop_time
                     if (Decimal(str(selfPeakChange)) >= to_sell) or malicious or is_drop_time:
+                        self.instrumentation.record_exit_signal(
+                            mint_id,
+                            owner,
+                            exit_reason=condition_level,
+                            signal_price=price,
+                            theoretical_best_price=peak_price,
+                        )
                         logging.info(f"""{cc.LIGHT_GREEN}Selling {mint_id} at {str(selfPeakChange)}, is malicious: {malicious}, is drop-time: {is_drop_time}.{cc.RESET}""")
                         await self.sell(mint_id, token_balance, condition_level, owner, trust_level, selfBuyPrice)
                         logging.info(f"{cc.LIGHT_GRAY}Token has been sold, stopping the session.{cc.RESET}")
@@ -850,6 +1018,24 @@ class Dexter:
                             Buys:{buys} Sells:{sells} Swaps:{swaps}{cc.RESET}
                             """
                         )
+                        self.instrumentation.record_session_update(
+                            mint_id,
+                            owner,
+                            price=price,
+                            highest_price=peak_price,
+                            buys=buys,
+                            sells=sells,
+                            liquidity=liquidity,
+                            composite_score=composite_score,
+                            current_target_pct=to_sell,
+                            state_reason=condition_level,
+                            creator_token_amount=holders.get(owner, {}).get("balance", 0),
+                            creator_sold=sells > 0,
+                            txns_in_zero=0,
+                            txns_in_n=swaps,
+                            malicious=malicious,
+                            drop_time=is_drop_time,
+                        )
 
                     # Stagnant checks
                     """
@@ -857,11 +1043,25 @@ class Dexter:
                         If price is < 3e-8 and time since last change > 13s, sell.
                     """
                     if time_since_last_change > 1800:
+                        self.instrumentation.record_exit_signal(
+                            mint_id,
+                            owner,
+                            exit_reason="stagnant",
+                            signal_price=price,
+                            theoretical_best_price=peak_price,
+                        )
                         logging.info(f"{cc.YELLOW}{mint_id} stagnant(no price change>30m). Stop.{cc.RESET}")
                         await self.sell(mint_id, token_balance, "stagnant", owner, trust_level, selfBuyPrice)
                         break
 
                     if price < Decimal('0.0000000300') and time_since_last_change > STAGNANT_UNDER_PRICE: # Stagnant and low price
+                        self.instrumentation.record_exit_signal(
+                            mint_id,
+                            owner,
+                            exit_reason="malicious",
+                            signal_price=price,
+                            theoretical_best_price=peak_price,
+                        )
                         logging.info(f"{cc.YELLOW}{mint_id} stagnant(price<3e-8 & tx>13s). Stop.{cc.RESET}")
                         await self.sell(mint_id, token_balance, "malicious", owner, trust_level, selfBuyPrice)
                         break
@@ -905,6 +1105,7 @@ class Dexter:
                     key=lambda x: x[1]['performance_score'],
                     reverse=True
                 )
+                self.instrumentation.export_leaderboard(sorted_leaderboard)
 
                 logging.info(f"{cc.LIGHT_CYAN}Top 10 Leaderboard Entries:{cc.RESET}")
                 for rank, (creator, entry) in enumerate(sorted_leaderboard[:10], start=1):
@@ -976,6 +1177,7 @@ class Dexter:
     async def close(self):
         try:
             logging.info(f"{cc.CYAN}Closing Dexter...{cc.RESET}")
+            self.instrumentation.finalize()
             await self.pump_swap.close()
             await self.close_db_pool()
             await self.swaps.close()

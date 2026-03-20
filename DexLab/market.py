@@ -3,9 +3,11 @@ from decimal import Decimal
 try:
     from common_ import *
     from colors import *
+    from instrumentation import ReplayExporter
 except ImportError:
     from .common_ import *
     from .colors import *
+    from .instrumentation import ReplayExporter
 import logging, time
 import asyncio, json, requests, subprocess
 import os
@@ -55,6 +57,7 @@ class Market:
         self.mint_locks = defaultdict(asyncio.Lock)  # One lock per mint_id
         self.count_iter = 0
         self.sema = asyncio.Semaphore(1000)
+        self.replay_exporter = ReplayExporter()
 
     async def init_db(self):
         self.db_pool = await asyncpg.create_pool(self.db_dsn, min_size=1, max_size=5000, timeout=60)
@@ -408,6 +411,16 @@ class Market:
                         self.sub_second_counters.pop(row_data["mint_id"], None)
                     except KeyError:
                         logging.warning(f"Mint ID {row_data['mint_id']} not found in sub_second_counters.")
+                try:
+                    self.replay_exporter.export_record(
+                        row_data["mint_id"],
+                        {
+                            "kind": "stagnant_mint",
+                            "row": row_data,
+                        },
+                    )
+                except Exception as exc:
+                    logging.warning(f"Replay export failed for {row_data['mint_id']}: {exc}")
 
     async def monitor_single_mint(self, mint_id):
         """
