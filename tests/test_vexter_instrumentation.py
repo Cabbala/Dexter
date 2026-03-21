@@ -101,6 +101,8 @@ def test_instrumentation_writes_expected_artifacts(monkeypatch, tmp_path):
         tx_signature="sell-tx",
         exit_reason="safe",
         wallet_balance_after=1010000,
+        confirmation_path="paper_fill",
+        tx_strategy="paper_quote",
     )
     writer.record_position_closed("mint-1", "creator-1", stale_position_flag=False)
     writer.finalize()
@@ -123,6 +125,9 @@ def test_instrumentation_writes_expected_artifacts(monkeypatch, tmp_path):
     assert "entry_fill" in event_types
     assert "position_closed" in event_types
     assert event_types[-1] == "run_summary"
+    exit_fill_event = next(event for event in events if event["event_type"] == "exit_fill")
+    assert exit_fill_event["payload"]["confirmation_path"] == "paper_fill"
+    assert exit_fill_event["payload"]["tx_strategy"] == "paper_quote"
 
 
 def test_replay_exporter_writes_stagnant_snapshot(monkeypatch, tmp_path):

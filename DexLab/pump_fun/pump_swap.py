@@ -21,6 +21,7 @@ from aiohttp import ClientSession
 import time, requests
 import struct
 from typing import List, Optional
+from decimal import Decimal
 try: from .pump_bond import get_bonding_curve_state
 except: from .pump_bond import get_bonding_curve_state
 
@@ -169,6 +170,86 @@ class PumpFun:
             return 0
 
         return ((net_sol - 1) * virtual_token_reserves) // (virtual_sol_reserves + net_sol - 1)
+
+    def quote_curve_price(self, curve_state) -> Decimal:
+        if curve_state is None:
+            return Decimal("0")
+
+        virtual_sol_reserves = Decimal(int(getattr(curve_state, "virtual_sol_reserves", 0))) / Decimal("1e9")
+        virtual_token_reserves = Decimal(int(getattr(curve_state, "virtual_token_reserves", 0))) / Decimal("1e6")
+        if virtual_sol_reserves <= 0 or virtual_token_reserves <= 0:
+            return Decimal("0")
+        return virtual_sol_reserves / virtual_token_reserves
+
+    def quote_sell_exact_tokens_in_sol_out(self, curve_state, token_amount: int) -> int:
+        if curve_state is None:
+            return 0
+
+        virtual_sol_reserves = int(getattr(curve_state, "virtual_sol_reserves", 0))
+        virtual_token_reserves = int(getattr(curve_state, "virtual_token_reserves", 0))
+        if token_amount <= 0 or virtual_sol_reserves <= 0 or virtual_token_reserves <= 0:
+            return 0
+
+        gross_sol_out = (token_amount * virtual_sol_reserves) // (virtual_token_reserves + token_amount)
+        if gross_sol_out <= 0:
+            return 0
+
+        return max((gross_sol_out * (10_000 - DEFAULT_BUY_QUOTE_FEE_BPS)) // 10_000, 0)
+
+    async def paper_buy_quote(
+            self,
+            mint_address: str,
+            bonding_curve_pda: str,
+            sol_amount: int,
+            creator: Optional[str] = None,
+        ):
+        mint_address = PublicKey.from_string(mint_address)
+        bonding_curve_pda = PublicKey.from_string(bonding_curve_pda)
+
+        try:
+            curve_state, _ = await self.get_curve_context(bonding_curve_pda)
+        except ValueError as exc:
+            logging.warning(f"Skipping paper buy for {mint_address}: {exc}")
+            return "creator_vault_unavailable"
+        if curve_state is not None and getattr(curve_state, "complete", False):
+            return "migrated"
+
+        token_amount = self.quote_buy_exact_sol_in_tokens_out(curve_state, sol_amount)
+        if token_amount <= 0:
+            return "zero_quote"
+
+        return {
+            "fill_qty": token_amount,
+            "fill_price": self.quote_curve_price(curve_state),
+            "lamports_spent": int(sol_amount),
+        }
+
+    async def paper_sell_quote(
+            self,
+            mint_address: str,
+            bonding_curve_pda: str,
+            token_amount: int,
+            creator: Optional[str] = None,
+        ):
+        mint_address = PublicKey.from_string(mint_address)
+        bonding_curve_pda = PublicKey.from_string(bonding_curve_pda)
+
+        try:
+            curve_state, _ = await self.get_curve_context(bonding_curve_pda)
+        except ValueError as exc:
+            logging.warning(f"Skipping paper sell for {mint_address}: {exc}")
+            return "creator_vault_unavailable"
+        if curve_state is not None and getattr(curve_state, "complete", False):
+            return "migrated"
+
+        lamports_out = self.quote_sell_exact_tokens_in_sol_out(curve_state, token_amount)
+        if lamports_out <= 0:
+            return "zero_quote"
+
+        return {
+            "fill_price": self.quote_curve_price(curve_state),
+            "lamports_out": int(lamports_out),
+        }
 
     async def get_curve_context(
         self,

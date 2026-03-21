@@ -1,4 +1,5 @@
 import asyncio
+import atexit
 import logging
 import os
 import sys
@@ -55,6 +56,7 @@ logging.basicConfig(
 
 ROLLING_WINDOW_SIZE = 5
 SINGLE_LOCK = True
+DEFAULT_PAPER_WALLET_BALANCE = 10 * 1_000_000_000
 
 BLACKLIST = []
 DEX_DIR = os.path.abspath(os.path.dirname(__file__))
@@ -81,14 +83,18 @@ class Dexter:
         self.db_dsn = db_dsn
         self.pool = None
         self.analyzer = Analyzer(db_dsn)
-        self.instrumentation = DexterInstrumentation(DEX_DIR)
+        self.execution_mode = os.getenv("VEXTER_MODE", "observe_live").strip().lower()
+        self.instrumentation = DexterInstrumentation(DEX_DIR, mode=self.execution_mode)
         self.last_processed_timestamp = None
         self.leaderboard = None
         self.active_sessions = {}
         self.holdings = {}
         self.privkey = Keypair.from_bytes(base58.b58decode(PRIV_KEY))
         self.wallet_balance = 0
+        self.paper_wallet_balance = DEFAULT_PAPER_WALLET_BALANCE
         self.pending_buy_spend = {}
+        self.paper_positions = {}
+        self.paper_pending_fills = {}
         self.wallet = str(self.privkey.pubkey())
         self.dex_dir = DEX_DIR
         self.logs = asyncio.Queue()
@@ -106,11 +112,13 @@ class Dexter:
         self.sub_second_counters = {}
         self.mint_locks = collections.defaultdict(asyncio.Lock)  # One lock per mint_id
         self.instrumentation.export_masked_config(self._settings_snapshot())
+        atexit.register(self._finalize_instrumentation)
 
     def _settings_snapshot(self):
         return {
             "db_dsn": DB_DSN,
             "wallet": self.wallet,
+            "execution_mode": self.execution_mode,
             "buy_amount_tl_1": AMOUNT_BUY_TL_1,
             "buy_amount_tl_2": AMOUNT_BUY_TL_2,
             "buy_fee_usd": BUY_FEE,
@@ -142,6 +150,24 @@ class Dexter:
             return float((sol_reserves + (token_reserves * Decimal(price))) * self.analyzer.sol_price_usd)
         except Exception:
             return 0.0
+
+    def _is_paper_live(self) -> bool:
+        return self.execution_mode == "paper_live"
+
+    def _tracked_wallet_balance(self) -> int:
+        if self._is_paper_live():
+            return int(self.paper_wallet_balance)
+        return int(self.wallet_balance)
+
+    def _synthetic_tx_signature(self, action: str, mint_id: str, attempt_index: int | None = None) -> str:
+        suffix = f":{attempt_index}" if attempt_index is not None else ""
+        return f"paper-{action}:{mint_id}{suffix}"
+
+    def _finalize_instrumentation(self):
+        try:
+            self.instrumentation.finalize()
+        except Exception:
+            pass
     
     """
         Market part
@@ -456,7 +482,7 @@ class Dexter:
         return int(sum(self.pending_buy_spend.values()))
 
     def _available_wallet_balance(self) -> int:
-        return max(0, int(self.wallet_balance - self._reserved_wallet_balance()))
+        return max(0, int(self._tracked_wallet_balance() - self._reserved_wallet_balance()))
 
     def _reserve_buy_spend(self, mint_id: str, lamports: int):
         self.pending_buy_spend[mint_id] = int(max(0, lamports))
@@ -469,16 +495,84 @@ class Dexter:
         if reserved_cost <= 0 and confirmed_wallet_balance is None:
             return
 
-        old_balance = self.wallet_balance
-        if confirmed_wallet_balance is not None:
-            self.wallet_balance = int(confirmed_wallet_balance)
-        elif reserved_cost > 0:
-            self.wallet_balance = max(0, int(self.wallet_balance - reserved_cost))
+        old_balance = self._tracked_wallet_balance()
+        if self._is_paper_live():
+            if confirmed_wallet_balance is not None:
+                self.paper_wallet_balance = int(confirmed_wallet_balance)
+            elif reserved_cost > 0:
+                self.paper_wallet_balance = max(0, int(self.paper_wallet_balance - reserved_cost))
+            new_balance = self.paper_wallet_balance
+        else:
+            if confirmed_wallet_balance is not None:
+                self.wallet_balance = int(confirmed_wallet_balance)
+            elif reserved_cost > 0:
+                self.wallet_balance = max(0, int(self.wallet_balance - reserved_cost))
+            new_balance = self.wallet_balance
 
         logging.info(
-            f"Wallet difference: {old_balance} -> {self.wallet_balance} = "
-            f"{self.wallet_balance - old_balance}"
+            f"Wallet difference: {old_balance} -> {new_balance} = "
+            f"{new_balance - old_balance}"
         )
+
+    async def _paper_buy_fill(self, mint_id, bonding_curve, lamports, owner, attempt_index, reserved_cost, observed_price):
+        paper_quote = await self.pump_swap.paper_buy_quote(
+            mint_id,
+            bonding_curve,
+            lamports,
+            owner,
+        )
+        if isinstance(paper_quote, str):
+            return paper_quote
+
+        fill_price = Decimal(str(observed_price)) if observed_price and Decimal(str(observed_price)) > 0 else Decimal(str(paper_quote.get("fill_price", 0)))
+        fill_qty = int(paper_quote.get("fill_qty", 0))
+        if fill_price <= 0 or fill_qty <= 0:
+            return "zero_quote"
+
+        self._reserve_buy_spend(mint_id, reserved_cost)
+        self._finalize_buy_spend(mint_id)
+        tx_id = self._synthetic_tx_signature("entry", mint_id, attempt_index)
+        self.paper_positions[mint_id] = {
+            "fill_price": fill_price,
+            "fill_qty": fill_qty,
+            "reserved_cost": reserved_cost,
+        }
+        self.paper_pending_fills[mint_id] = {
+            "attempt_index": attempt_index,
+            "tx_signature": tx_id,
+            "fill_price": fill_price,
+            "fill_qty": fill_qty,
+            "wallet_balance_after": self.paper_wallet_balance,
+            "confirmation_path": "paper_fill",
+        }
+        return tx_id
+
+    async def _paper_sell_fill(self, mint_id, bonding_curve, amount, buy_price):
+        paper_quote = await self.pump_swap.paper_sell_quote(
+            mint_id,
+            bonding_curve,
+            amount,
+        )
+        if isinstance(paper_quote, str):
+            return paper_quote
+
+        fill_price = Decimal(str(paper_quote.get("fill_price", 0)))
+        if fill_price <= 0:
+            current_price = await self.get_latest_price(mint_id)
+            fill_price = current_price if current_price > 0 else Decimal(str(buy_price))
+
+        lamports_out = int(paper_quote.get("lamports_out", 0))
+        if lamports_out <= 0 and fill_price > 0:
+            lamports_out = int((Decimal(amount) / Decimal("1e6")) * fill_price * Decimal("1e9"))
+        if fill_price <= 0 or lamports_out <= 0:
+            return "zero_quote"
+
+        self.paper_wallet_balance = int(self.paper_wallet_balance + lamports_out)
+        return {
+            "fill_price": fill_price,
+            "wallet_balance_after": self.paper_wallet_balance,
+            "tx_signature": self._synthetic_tx_signature("exit", mint_id),
+        }
 
     async def get_latest_price(self, mint_id: str) -> Decimal:
         """
@@ -521,7 +615,7 @@ class Dexter:
                 self.holdings.pop(mint_id, None)
                 logging.info(
                     f"{cc.RED}Insufficient balance for {mint_id}, confirmed_wallet: "
-                    f"{self.wallet_balance}, reserved: {self._reserved_wallet_balance()}, "
+                    f"{self._tracked_wallet_balance()}, reserved: {self._reserved_wallet_balance()}, "
                     f"available: {available_balance}, required: {reserved_cost}.{cc.RESET}"
                 )
                 self.instrumentation.record_entry_rejected(
@@ -554,8 +648,36 @@ class Dexter:
                 wallet_available_before=available_balance,
                 reserved_balance_before=self._reserved_wallet_balance(),
                 reserved_cost=reserved_cost,
-                tx_strategy="pump_buy_priority_fee",
+                tx_strategy="paper_quote" if self._is_paper_live() else "pump_buy_priority_fee",
             )
+
+            if self._is_paper_live():
+                tx_id = await self._paper_buy_fill(
+                    mint_id,
+                    bonding_curve,
+                    lamports,
+                    owner,
+                    attempt_index,
+                    reserved_cost,
+                    price,
+                )
+                if tx_id in {"migrated", "zero_quote", "creator_vault_unavailable"}:
+                    self.holdings.pop(mint_id, None)
+                    self.instrumentation.record_entry_rejected(
+                        mint_id,
+                        owner,
+                        reject_reason=tx_id,
+                        attempt_index=attempt_index,
+                    )
+                    return tx_id
+
+                logging.info(
+                    f"{cc.WHITE}Resolved paper buy for {mint_id} "
+                    f"(local_price: {price:.10f}, trust_level: {trust_level}, "
+                    f"slippage: {slippage}, tx: {tx_id}).{cc.RESET}"
+                )
+                await self.save_result({"type": "paper_buy", "mint_id": mint_id, "owner": owner, "price": str(price), "trust_level": trust_level})
+                return tx_id
 
             tx_id = await self.pump_swap.pump_buy(
                 mint_id, 
@@ -642,6 +764,41 @@ class Dexter:
             fee = usd_to_microlamports(SELL_FEE, self.analyzer.sol_price_usd, 50_000) if trust_level == 1 else usd_to_microlamports(SELL_FEE, self.analyzer.sol_price_usd, 50_000)
             
             if mint_id in self.holdings:
+                if self._is_paper_live():
+                    paper_fill = await self._paper_sell_fill(mint_id, bonding_curve, amount, buy_price)
+                    if isinstance(paper_fill, str) and paper_fill in {"migrated", "zero_quote", "creator_vault_unavailable"}:
+                        logging.info(f"{cc.RED}Skipping paper sell for {mint_id}: {paper_fill}.{cc.RESET}")
+                        self.holdings.pop(mint_id, None)
+                        self.paper_positions.pop(mint_id, None)
+                        return paper_fill
+
+                    price = Decimal(str(paper_fill["fill_price"]))
+                    peak_change = await self._process_peak_change(buy_price, price)
+                    logging.info(f"{cc.LIGHT_MAGENTA}Paper sold {amount} of {mint_id} with profit {peak_change:.6f}")
+
+                    self.holdings.pop(mint_id, None)
+                    self.paper_positions.pop(mint_id, None)
+                    await self.save_result({"mint_id": mint_id, "owner": owner, "profit": peak_change, "reason": reason, "mode": "paper_live"})
+                    await self._validate_result(owner, reason)
+
+                    self.instrumentation.record_exit_fill(
+                        mint_id,
+                        owner,
+                        fill_price=price,
+                        fill_qty=amount,
+                        tx_signature=paper_fill["tx_signature"],
+                        exit_reason=reason,
+                        wallet_balance_after=paper_fill["wallet_balance_after"],
+                        confirmation_path="paper_fill",
+                        tx_strategy="paper_quote",
+                    )
+                    self.instrumentation.record_position_closed(
+                        mint_id,
+                        owner,
+                        stale_position_flag=reason in {"stagnant", "drop-time"},
+                    )
+                    return paper_fill["tx_signature"]
+
                 tx_id_sell = await self.pump_swap.pump_sell(
                     mint_id, 
                     bonding_curve,
@@ -826,19 +983,25 @@ class Dexter:
 
                     if not skip_if_done:
                         confirmed_wallet_balance = None
-                        we = holders.get(self.wallet, {})
-                        balance = we.get("balance", 0)
-                        balance_changes = we.get("balance_changes", [])
-                        if balance_changes:
-                            for bc in balance_changes:
-                                if bc.get("type", "") == "buy":
-                                    selfBuyPrice = Decimal(bc.get("price_was", 0))
-                                    token_balance = balance
-                                    break
+                        paper_fill = self.paper_pending_fills.pop(mint_id, None) if self._is_paper_live() else None
+                        if paper_fill:
+                            token_balance = int(paper_fill.get("fill_qty", 0))
+                            selfBuyPrice = Decimal(str(paper_fill.get("fill_price", 0)))
+                            confirmed_wallet_balance = int(paper_fill.get("wallet_balance_after", self.paper_wallet_balance))
                         else:
-                            selfBuyPrice = Decimal('0')
+                            we = holders.get(self.wallet, {})
+                            balance = we.get("balance", 0)
+                            balance_changes = we.get("balance_changes", [])
+                            if balance_changes:
+                                for bc in balance_changes:
+                                    if bc.get("type", "") == "buy":
+                                        selfBuyPrice = Decimal(bc.get("price_was", 0))
+                                        token_balance = balance
+                                        break
+                            else:
+                                selfBuyPrice = Decimal('0')
 
-                        if buy_retry >= 10:
+                        if buy_retry >= 10 and not self._is_paper_live():
                             logging.info(f"{cc.RED}Buy retry exceeded for {mint_id}.\nTrying a fallback...{cc.RESET}")
                             results = await self.swaps.get_swap_tx(buy_tx_id, mint_id, tx_type="buy")
                             if not results or isinstance(results, str):
@@ -879,8 +1042,9 @@ class Dexter:
                                 fill_price=selfBuyPrice,
                                 fill_qty=token_balance,
                                 tx_signature=buy_tx_id,
-                                wallet_balance_after=self.wallet_balance,
-                                confirmation_path="rpc_fallback" if buy_retry >= 10 else "holder_balance",
+                                wallet_balance_after=confirmed_wallet_balance if confirmed_wallet_balance is not None else self.wallet_balance,
+                                confirmation_path="paper_fill" if paper_fill else "rpc_fallback" if buy_retry >= 10 else "holder_balance",
+                                attempt_index=paper_fill.get("attempt_index") if paper_fill else None,
                             )
                             entry_fill_emitted = True
 
@@ -1078,6 +1242,8 @@ class Dexter:
         self.active_sessions.pop(mint_id, None)
         self.swap_folder.pop(mint_id, None)
         self.holdings.pop(mint_id, None)
+        self.paper_positions.pop(mint_id, None)
+        self.paper_pending_fills.pop(mint_id, None)
         self._release_buy_spend(mint_id)
         logging.info(f"{cc.BLUE}Session ended {mint_id}.{cc.RESET}")
 
@@ -1158,8 +1324,14 @@ class Dexter:
                 api_key=RPC_URL
             )
 
-            self.wallet_balance = await self.swaps.fetch_wallet_balance_sol()
-            logging.info(f"{cc.CYAN}{cc.BRIGHT}Initialized wallet {self.wallet} with: {self.wallet_balance} SOL")
+            if self._is_paper_live():
+                logging.info(
+                    f"{cc.CYAN}{cc.BRIGHT}Initialized paper wallet {self.wallet} "
+                    f"with: {Decimal(self.paper_wallet_balance) / Decimal('1e9')} SOL{cc.RESET}"
+                )
+            else:
+                self.wallet_balance = await self.swaps.fetch_wallet_balance_sol()
+                logging.info(f"{cc.CYAN}{cc.BRIGHT}Initialized wallet {self.wallet} with: {self.wallet_balance} SOL")
 
             await asyncio.gather(
                 self.subscribe(),
@@ -1177,7 +1349,7 @@ class Dexter:
     async def close(self):
         try:
             logging.info(f"{cc.CYAN}Closing Dexter...{cc.RESET}")
-            self.instrumentation.finalize()
+            self._finalize_instrumentation()
             await self.pump_swap.close()
             await self.close_db_pool()
             await self.swaps.close()

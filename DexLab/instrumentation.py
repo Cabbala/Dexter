@@ -674,6 +674,8 @@ class DexterInstrumentation:
         tx_signature: str,
         exit_reason: str,
         wallet_balance_after: int,
+        confirmation_path: str = "rpc_getTransaction",
+        tx_strategy: str = "pump_sell_priority_fee",
     ) -> None:
         session = self._ensure_session(mint_id, creator=creator)
         fill_time = utc_now()
@@ -693,6 +695,8 @@ class DexterInstrumentation:
                 "tx_signature": tx_signature,
                 "exit_reason": exit_reason,
                 "wallet_balance_after": int(wallet_balance_after),
+                "confirmation_path": confirmation_path,
+                "tx_strategy": tx_strategy,
             },
             session_id=session["session_id"],
             mint=mint_id,
