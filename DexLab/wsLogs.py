@@ -163,6 +163,9 @@ class DexBetterLogs:
                 idx = log.find("Program data: ")
                 raw_data = log[idx + len("Program data: "):]
                 if raw_data.startswith("G3K"):
+                    # Treat decoded creation payloads as mint events even when
+                    # the upstream log no longer emits a separate InitializeMint line.
+                    is_mint = True
                     raw_data = self.serializer.parse_pumpfun_creation(raw_data)
                 elif raw_data.startswith("vdt"):
                     raw_data = self.serializer.parse_pumpfun_transaction(raw_data)
