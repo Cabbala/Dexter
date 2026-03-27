@@ -111,13 +111,51 @@ class DexBetterLogs:
             if clean_log:
                 is_mint = clean_log["is_mint"]
                 sig = clean_log["sig"]
+                slot = clean_log["slot"]
                 program_data = clean_log["program_data"]
+                raw_logs = clean_log.get("raw_logs", [])
 
                 for idx, data in program_data.items():
+                    if not isinstance(data, dict):
+                        logging.debug(
+                            "Ignoring undecoded program payload for %s at log index %s: %r",
+                            sig,
+                            idx,
+                            data,
+                        )
+                        continue
+                    raw_event_fingerprint = None
+                    try:
+                        raw_event_fingerprint = await self.market.record_raw_event(
+                            program,
+                            sig,
+                            slot,
+                            idx,
+                            "mints" if is_mint and "bonding_curve" in data else "swaps",
+                            is_mint and "bonding_curve" in data,
+                            data,
+                            raw_logs=raw_logs,
+                        )
+                    except Exception as exc:
+                        logging.warning(f"Phase2 raw event capture failed for {sig}: {exc}")
                     if is_mint and "bonding_curve" in data:
-                        await self.market.populate_market(program, "mints", sig, data)
+                        await self.market.populate_market(
+                            program,
+                            "mints",
+                            sig,
+                            data,
+                            last_event_fingerprint=raw_event_fingerprint,
+                            last_event_slot=slot,
+                        )
                     elif "bonding_curve" in data or "sol_amount" in data:
-                        await self.market.populate_market(program, "swaps", sig, data)
+                        await self.market.populate_market(
+                            program,
+                            "swaps",
+                            sig,
+                            data,
+                            last_event_fingerprint=raw_event_fingerprint,
+                            last_event_slot=slot,
+                        )
         except Exception as e:
             logging.error(f"{cc.RED}Error in handle_single_log: {e}{cc.RESET}")
             traceback.print_exc()
@@ -134,7 +172,8 @@ class DexBetterLogs:
                         "sig": result['signature'],
                         "slot": result['slot'],
                         "is_mint": log_details[0],
-                        "program_data": log_details[1]
+                        "program_data": log_details[1],
+                        "raw_logs": result["logs"],
                     }
         except Exception as e:
             logging.error(f"{cc.RED}Error when processing log, {e}{cc.RESET}")
@@ -169,6 +208,13 @@ class DexBetterLogs:
                     raw_data = self.serializer.parse_pumpfun_creation(raw_data)
                 elif raw_data.startswith("vdt"):
                     raw_data = self.serializer.parse_pumpfun_transaction(raw_data)
+                if not isinstance(raw_data, dict):
+                    logging.debug(
+                        "Skipping undecoded program data for %s at log index %s.",
+                        sig,
+                        len(program_data),
+                    )
+                    continue
                 program_data[len(program_data)] = raw_data
         return [is_mint, program_data]
 

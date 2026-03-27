@@ -1,5 +1,7 @@
-import asyncpg
 import asyncio
+import asyncpg
+
+from dexter_data_store import PHASE2_SCHEMA_STATEMENTS
 
 async def initialize_db():
     # Connect to the default 'postgres' database as superuser
@@ -95,6 +97,9 @@ async def initialize_db():
     CREATE INDEX IF NOT EXISTS idx_mints_timestamp ON mints(timestamp);
     CREATE INDEX IF NOT EXISTS idx_stagnant_mints_timestamp ON stagnant_mints(timestamp);
     """)
+
+    for statement in PHASE2_SCHEMA_STATEMENTS:
+        await conn.execute(statement)
 
     await conn.close()
     print("PostgreSQL database, tables, and indexes initialized successfully.")
