@@ -8,11 +8,20 @@ except ImportError:
     from .common_ import *
     from .colors import *
     from .instrumentation import ReplayExporter
+import datetime as dt
 import logging, time
 import asyncio, json, requests, subprocess
+import math
 import os
 import platform, shlex, traceback
 from collections import defaultdict
+
+from dexter_data_store import Phase2Store
+from dexter_time import (
+    normalize_event_payload_timestamp,
+    normalize_unix_timestamp,
+    safe_utc_datetime_from_timestamp,
+)
 
 # Change this to your pg_dump path
 PG_DUMP_PATH = r"C:\Program Files\PostgreSQL\17\bin\pg_dump.exe" 
@@ -38,10 +47,42 @@ class DecimalEncoder(json.JSONEncoder):
             return str(obj)
         return super().default(obj)
 
+
+def _parse_json_blob(value, default):
+    if not value:
+        return default
+    if isinstance(value, str):
+        return json.loads(value)
+    return value
+
+
+def _parse_stagnant_timestamp(row_data):
+    price_history = _parse_json_blob(row_data.get("price_history"), {})
+    if price_history:
+        first_key = sorted(price_history.keys(), key=lambda item: float(item))[0]
+        return safe_utc_datetime_from_timestamp(first_key)
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def _finite_float(value, default=None):
+    if value is None:
+        return default
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            return default
+        return float(value)
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(result):
+        return default
+    return result
+
 class Market:
     def __init__(self, session, serializer, stop_event,
                  db_dsn="postgres://dexter_user:admin123@127.0.0.1/dexter_db",
-                 parent=None):
+                 parent=None, phase2_store=None):
         self.session = session
         self.serializer = serializer
         self.stop_event = stop_event
@@ -50,6 +91,7 @@ class Market:
         self.mint_monitor_tasks = {}
         self.db_pool = None
         self.sub_second_counters = {}
+        self.phase2 = phase2_store or Phase2Store(self.db_dsn)
 
         self.sol_price_usd = Decimal(self.get_solana_price_usd())
         self.total_supply = Decimal('1000000000')
@@ -61,6 +103,13 @@ class Market:
 
     async def init_db(self):
         self.db_pool = await asyncpg.create_pool(self.db_dsn, min_size=1, max_size=5000, timeout=60)
+        if self.phase2 is not None:
+            try:
+                self.phase2.bind_pool(self.db_pool)
+                await self.phase2.ensure_schema()
+            except Exception as exc:
+                logging.warning(f"Phase2 schema initialization failed; continuing without phase2 capture: {exc}")
+                self.phase2 = None
         logging.info(f"{cc.WHITE}{cc.BRIGHT}Database connection pool initialized. Dexter is starting...{cc.RESET}")
         async with self.db_pool.acquire() as conn:
             tables = await conn.fetch(
@@ -84,7 +133,28 @@ class Market:
             logging.error(f"Database integrity check failed: {e}")
             return False
 
-    async def store_mint(self, mint_id, data):
+    async def record_raw_event(self, program, sig, slot, log_index, tx_type, is_mint, data, raw_logs=None):
+        if self.phase2 is None:
+            return None
+        payload = normalize_event_payload_timestamp(data, fallback=time.time()) or data
+        observed_at = safe_utc_datetime_from_timestamp(
+            payload.get("timestamp"),
+            fallback=time.time(),
+        )
+        return await self.phase2.record_raw_event(
+            source="collector",
+            program=program,
+            signature=sig,
+            slot=int(slot or 0),
+            log_index=int(log_index),
+            event_type=tx_type,
+            is_mint=bool(is_mint),
+            payload=payload,
+            raw_logs=raw_logs or [],
+            observed_at=observed_at,
+        )
+
+    async def store_mint(self, mint_id, data, last_event_fingerprint=None, last_event_slot=None):
         if self.stop_event.is_set():
             logging.warning("Shutdown signal received. Skipping store_mint.")
             return
@@ -122,6 +192,44 @@ class Market:
                     data.get("bonding_curve"),
                     data.get("created"),
                 )
+            if self.phase2 is not None:
+                try:
+                    await self.phase2.record_mint_snapshot(
+                        mint_id=mint_id,
+                        lifecycle_state="active",
+                        recorded_at=safe_utc_datetime_from_timestamp(
+                            data.get("created", int(time.time())),
+                            fallback=time.time(),
+                        ),
+                        last_event_fingerprint=last_event_fingerprint,
+                        last_event_slot=last_event_slot,
+                        snapshot={
+                            "mint_id": mint_id,
+                            "owner": data.get("owner", ""),
+                            "name": data["info"].get("name", ""),
+                            "symbol": data["info"].get("symbol", ""),
+                            "bonding_curve": data.get("bonding_curve"),
+                            "market_cap": _finite_float(data.get("market_cap"), 0.0),
+                            "price_history": data.get("price_history", {}),
+                            "price_usd": _finite_float(data.get("price_usd"), 0.0),
+                            "liquidity": _finite_float(data.get("liquidity"), 0.0),
+                            "high_price": _finite_float(data.get("high_price"), 0.0),
+                            "low_price": _finite_float(data.get("low_price")),
+                            "open_price": _finite_float(data.get("open_price", Decimal("0")), 0.0),
+                            "current_price": _finite_float(data.get("current_price"), 0.0),
+                            "age": _finite_float(data.get("age"), 0.0),
+                            "tx_counts": data.get("tx_counts", {}),
+                            "volume": {"30sec": {}, "1min": {}, "2min": {}, "5min": {}},
+                            "holders": data.get("holders", {}),
+                            "mint_sig": data.get("mint_sig"),
+                            "created_at": safe_utc_datetime_from_timestamp(
+                                data.get("created", int(time.time())),
+                                fallback=time.time(),
+                            ),
+                        },
+                    )
+                except Exception as exc:
+                    logging.warning(f"Phase2 mint snapshot capture failed for {mint_id}: {exc}")
         except Exception as e:
             logging.error(f"Error while storing mint: {e}")
 
@@ -138,7 +246,7 @@ class Market:
         except Exception as e:
             logging.error(f"Error updating mint in database: {e}")
 
-    async def populate_market(self, program, tx_type, sig, data):
+    async def populate_market(self, program, tx_type, sig, data, last_event_fingerprint=None, last_event_slot=None):
         mint = data.get('mint')
         if not mint:
             logging.error("No mint ID found in transaction data. Skipping update.")
@@ -162,11 +270,17 @@ class Market:
                 "mint_sig": sig,
                 "bonding_curve": data.get('bonding_curve', ""),
                 "created": int(time.time()),
-            })
+            }, last_event_fingerprint=last_event_fingerprint, last_event_slot=last_event_slot)
             self.start_monitor_for_mint(mint)
 
         elif tx_type == 'swaps':
-            await self.update_mint(program, mint, data)
+            await self.update_mint(
+                program,
+                mint,
+                data,
+                last_event_fingerprint=last_event_fingerprint,
+                last_event_slot=last_event_slot,
+            )
 
     def get_solana_price_usd(self):
         try:
@@ -184,10 +298,11 @@ class Market:
         d = 10
         return f"{value:.{d}f}" if value != Decimal('Infinity') else "Infinity"
 
-    async def update_mint(self, program, mint, data):
+    async def update_mint(self, program, mint, data, last_event_fingerprint=None, last_event_slot=None):
         try:
             self.count_iter += 1
             if program == PUMP_FUN:
+                event_data = normalize_event_payload_timestamp(data, fallback=time.time()) or data
                 lock = self.mint_locks[mint]  # The lock dedicated to this mint
                 async with lock:
                     async with self.db_pool.acquire() as conn:
@@ -206,10 +321,13 @@ class Market:
                         logging.error(f"JSONDecodeError for mint {mint}: {e}")
                         return
 
-                    current_timestamp = int(data["timestamp"])
+                    current_timestamp = normalize_unix_timestamp(
+                        event_data.get("timestamp"),
+                        fallback=time.time(),
+                    )
 
                     # Determine transaction type and update tx_counts
-                    tx_type = "buy" if data.get('is_buy', False) else "sell"
+                    tx_type = "buy" if event_data.get('is_buy', False) else "sell"
                     tx_counts['swaps'] += 1
                     if tx_type == "buy":
                         tx_counts['buys'] += 1
@@ -217,8 +335,8 @@ class Market:
                         tx_counts['sells'] += 1
 
                     # Compute price
-                    vsr = Decimal(data["virtual_sol_reserves"]) / Decimal('1e9')
-                    vtr = Decimal(data["virtual_token_reserves"]) / Decimal('1e6')
+                    vsr = Decimal(event_data["virtual_sol_reserves"]) / Decimal('1e9')
+                    vtr = Decimal(event_data["virtual_token_reserves"]) / Decimal('1e6')
                     price = self._compute_price(vsr, vtr)
 
                     # Track price history with unique sub-second timestamp
@@ -236,10 +354,10 @@ class Market:
                     price_history[str(unique_timestamp)] = float(price)
 
                     # Update holders
-                    user = data.get("user", "")
+                    user = event_data.get("user", "")
                     if user == "9BgYe7pZybM88PFKuLF6UUMv43jqMa99jaxU4EdbEnq7":
-                        logging.info(f"Catched our transaction: {row}\n{data}")
-                    token_amount = Decimal(data.get("token_amount", 0)) / Decimal('1e6')
+                        logging.info(f"Catched our transaction: {row}\n{event_data}")
+                    token_amount = Decimal(event_data.get("token_amount", 0)) / Decimal('1e6')
                     if user not in holders:
                         holders[user] = {
                             "balance": float(token_amount),
@@ -266,7 +384,7 @@ class Market:
 
                     if self.count_iter % 100 == 0:
                         self.count_iter = 0
-                        logging.info(f"{cc.CYAN}Socket Latency: {round(time.time() - data['timestamp'], 2)}s{cc.RESET}")
+                        logging.info(f"{cc.CYAN}Socket Latency: {round(max(0.0, time.time() - current_timestamp), 2)}s{cc.RESET}")
 
                     high_price = float(row['high_price'])
                     low_price = float(row['low_price'])
@@ -299,9 +417,51 @@ class Market:
                         "market_cap": float(self.get_market_cap(price)),
                         "price_usd": float(price * self.sol_price_usd),
                         "liquidity": float((vsr + (vtr * price)) * self.sol_price_usd),
-                        "age": float(time.time() - data["timestamp"]) if row['age'] == 0 else float(row['age']),
+                        "age": float(max(0.0, time.time() - current_timestamp)) if row['age'] == 0 else float(row['age']),
                     }
                     await self.update_mint_in_db(mint, updates)
+                    if self.phase2 is not None:
+                        try:
+                            await self.phase2.record_mint_snapshot(
+                                mint_id=mint,
+                                lifecycle_state="active",
+                                recorded_at=safe_utc_datetime_from_timestamp(
+                                    current_timestamp,
+                                    fallback=time.time(),
+                                ),
+                                last_event_fingerprint=last_event_fingerprint,
+                                last_event_slot=last_event_slot,
+                                snapshot={
+                                    "mint_id": mint,
+                                    "owner": row["owner"],
+                                    "name": row["name"],
+                                    "symbol": row["symbol"],
+                                    "bonding_curve": row["bonding_curve"],
+                                    "market_cap": updates["market_cap"],
+                                    "price_usd": updates["price_usd"],
+                                    "liquidity": updates["liquidity"],
+                                    "open_price": updates["open_price"],
+                                    "high_price": updates["high_price"],
+                                    "low_price": updates["low_price"],
+                                    "current_price": updates["current_price"],
+                                    "age": updates["age"],
+                                    "tx_counts": tx_counts,
+                                    "volume": volume,
+                                    "holders": holders,
+                                    "price_history": price_history,
+                                    "mint_sig": row["mint_sig"],
+                                    "created_at": (
+                                        safe_utc_datetime_from_timestamp(
+                                            row["created"],
+                                            fallback=time.time(),
+                                        )
+                                        if row["created"]
+                                        else None
+                                    ),
+                                },
+                            )
+                        except Exception as exc:
+                            logging.warning(f"Phase2 mint snapshot update failed for {mint}: {exc}")
         except Exception as e:
             logging.error(f"Error while updating mint: {e}")
             traceback.print_exc()
@@ -421,6 +581,33 @@ class Market:
                     )
                 except Exception as exc:
                     logging.warning(f"Replay export failed for {row_data['mint_id']}: {exc}")
+        if self.phase2 is not None:
+            try:
+                final_ohlc = _parse_json_blob(row_data.get("final_ohlc"), {})
+                await self.phase2.record_mint_snapshot(
+                    mint_id=row_data["mint_id"],
+                    lifecycle_state="stagnant",
+                    recorded_at=_parse_stagnant_timestamp(row_data),
+                    snapshot={
+                        "mint_id": row_data["mint_id"],
+                        "owner": row_data["owner"],
+                        "name": row_data["name"],
+                        "symbol": row_data["symbol"],
+                        "bonding_curve": row_data["bonding_curve"],
+                        "market_cap": _finite_float(row_data["final_market_cap"], 0.0),
+                        "open_price": _finite_float(final_ohlc.get("open"), 0.0),
+                        "high_price": _finite_float(final_ohlc.get("high"), 0.0),
+                        "low_price": _finite_float(final_ohlc.get("low")),
+                        "current_price": _finite_float(final_ohlc.get("close"), 0.0),
+                        "tx_counts": _parse_json_blob(row_data.get("tx_counts"), {}),
+                        "volume": _parse_json_blob(row_data.get("volume"), {}),
+                        "holders": _parse_json_blob(row_data.get("holders"), {}),
+                        "price_history": _parse_json_blob(row_data.get("price_history"), {}),
+                        "mint_sig": row_data.get("mint_sig"),
+                    },
+                )
+            except Exception as exc:
+                logging.warning(f"Phase2 stagnant snapshot capture failed for {row_data['mint_id']}: {exc}")
 
     async def monitor_single_mint(self, mint_id):
         """
